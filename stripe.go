@@ -59,16 +59,42 @@ func (s *StripeMethod) ChallengeRequest(amount, currency string) map[string]any 
 	return req
 }
 
-func (s *StripeMethod) Verify(ctx context.Context, cred *Credential, amount, currency string) (string, error) {
+// parsePayload decodes and validates the Stripe credential payload.
+func (s *StripeMethod) parsePayload(cred *Credential) (*stripePayload, error) {
 	var payload stripePayload
 	if err := json.Unmarshal(cred.Payload, &payload); err != nil {
-		return "", fmt.Errorf("mpp/stripe: unmarshal payload: %w", err)
+		return nil, fmt.Errorf("mpp/stripe: unmarshal payload: %w", err)
 	}
 	if payload.SPT == "" {
-		return "", &PaymentError{Problem: ProblemInvalidPayload, Detail: "missing spt in payload"}
+		return nil, &PaymentError{Problem: ProblemInvalidPayload, Detail: "missing spt in payload"}
 	}
 	if !strings.HasPrefix(payload.SPT, "spt_") {
-		return "", &PaymentError{Problem: ProblemInvalidPayload, Detail: "spt must start with spt_"}
+		return nil, &PaymentError{Problem: ProblemInvalidPayload, Detail: "spt must start with spt_"}
+	}
+	return &payload, nil
+}
+
+// ReplayKey implements ReplayKeyer. A Stripe payment is identified by the
+// challenge ID and the SPT, the same pair that forms the idempotency key.
+func (s *StripeMethod) ReplayKey(cred *Credential) (string, error) {
+	payload, err := s.parsePayload(cred)
+	if err != nil {
+		return "", err
+	}
+	return payload.SPT, nil
+}
+
+// Verify settles the credential by creating and confirming a PaymentIntent.
+//
+// Stripe answers a repeated idempotency key with the saved result of the first
+// call, so a resent credential looks like a fresh success. The middleware
+// prevents that by claiming each credential in a Store before calling Verify.
+// Callers that invoke Verify directly have no such claim, so a replayed
+// response is rejected for them.
+func (s *StripeMethod) Verify(ctx context.Context, cred *Credential, amount, currency string) (string, error) {
+	payload, err := s.parsePayload(cred)
+	if err != nil {
+		return "", err
 	}
 
 	// verify the credential echoes the expected amount and currency
@@ -103,13 +129,14 @@ func (s *StripeMethod) Verify(ctx context.Context, cred *Credential, amount, cur
 		return "", fmt.Errorf("mpp/stripe: create payment intent: %w", err)
 	}
 
-	// detect idempotency replay — payment was already processed with this key
-	if pi.Metadata != nil {
-		if replayed, ok := pi.Metadata["idempotent_replayed"]; ok && replayed == "true" {
-			return "", &PaymentError{
-				Problem: ProblemVerificationFailed,
-				Detail:  "payment has already been processed",
-			}
+	// Stripe flags a replayed idempotency key in a response header. Under a Store
+	// claim a replay is this same payment being retried (the SDK retrying a lost
+	// response, or the client retrying after a failed attempt), so it is accepted.
+	// Without a claim nothing else stops reuse, so it is rejected.
+	if !hasClaim(ctx) && pi.LastResponse != nil && pi.LastResponse.Header.Get("Idempotent-Replayed") == "true" {
+		return "", &PaymentError{
+			Problem: ProblemVerificationFailed,
+			Detail:  "payment has already been processed",
 		}
 	}
 

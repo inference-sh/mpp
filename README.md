@@ -75,7 +75,8 @@ agent                                 your server
 - **`OnPayment` callback** — hook into your billing system after payment verification
 - **`PriceFn`** — dynamic per-request pricing. look up the resource, evaluate your pricing formula, return the cost
 - **context helpers** — `ReceiptFromContext(ctx)` and `CredentialFromContext(ctx)` in your handler
-- **defense-in-depth** — HMAC binding + SPT prefix validation + request field verification + idempotency replay detection
+- **single-use credentials** — each paid credential is accepted for exactly one request, enforced by a pluggable `Store`
+- **defense-in-depth** — HMAC binding + SPT prefix validation + request field verification
 - **RFC 9457 problem details** — structured error responses per spec
 
 ## demo
@@ -94,6 +95,34 @@ curl -i -H "Authorization: Bearer my-api-key" http://localhost:8080/v1/generate
 # hit a free endpoint
 curl -i http://localhost:8080/health
 ```
+
+## replay protection
+
+a paid credential buys one request. before settling, the middleware claims the credential in a `Store`; a second request with the same credential gets a `402` and never reaches the payment provider.
+
+the default is an in-process `MemoryStore`. it covers a single server instance only. **if you run more than one instance, set a shared store**, otherwise a credential can be spent once per instance:
+
+```go
+mpp.Middleware(mpp.Config{
+    // ...
+    Store: myRedisStore, // implements mpp.Store
+})
+```
+
+```go
+type Store interface {
+    // atomically record key as spent; false if it already is. keep until expires.
+    Claim(ctx context.Context, key string, expires time.Time) (bool, error)
+    // drop a claim whose payment did not complete
+    Release(ctx context.Context, key string) error
+}
+```
+
+with Redis, `Claim` is `SET key 1 NX PXAT <expires>` and `Release` is `DEL key`. keys are hashes, so payment tokens are not written to the store.
+
+if settlement or `OnPayment` fails, the claim is released and the client can retry the same credential. stripe's idempotency key makes that retry return the original charge, so the payer is never charged twice. `OnPayment` can therefore run more than once for the same `receipt.Reference`; record payments idempotently on it.
+
+if the store is unavailable the request fails with a `500` and nothing is charged.
 
 ## payment methods
 
@@ -123,6 +152,14 @@ type Method interface {
 ```
 
 amounts are strings to support both fiat cents and crypto wei/lamports without precision loss.
+
+challenge IDs are deterministic, so clients quoted the same price in the same second share one. by default a challenge ID can be spent once, which makes those clients collide. implement `ReplayKeyer` to return what identifies a payment within a challenge (a token, a transaction hash) so each of them can pay:
+
+```go
+type ReplayKeyer interface {
+    ReplayKey(cred *Credential) (string, error)
+}
+```
 
 ## license
 

@@ -15,6 +15,8 @@ const (
 	credCtxKey    contextKey = "mpp.credential"
 )
 
+const problemInternalError = problemBaseURI + "internal-error"
+
 // PriceFn returns the price and currency for a given request.
 // Amount is a string in the smallest currency unit (e.g. "100" for $1.00 USD,
 // "1000000" for 1 USDC with 6 decimals). This is called before the handler
@@ -40,8 +42,17 @@ type Config struct {
 
 	// OnPayment is called after successful payment verification, before the handler.
 	// Use this to record the payment in your billing system.
+	// If it returns an error the request is not served and the credential may be
+	// retried, so it can be called again with the same receipt.Reference; record
+	// payments idempotently on that reference.
 	// The receipt and credential are also available via ReceiptFromContext / CredentialFromContext.
 	OnPayment func(ctx context.Context, receipt *Receipt, cred *Credential, amount, currency string) error
+
+	// Store records spent credentials so each one is accepted exactly once.
+	// Defaults to an in-process MemoryStore, which only protects a single
+	// server instance. Deployments with more than one instance must set a
+	// shared Store, otherwise a credential can be spent once per instance.
+	Store Store
 
 	// AllowFallthrough, when true, calls the next handler even without payment
 	// if no Authorization: Payment header is present. This lets you handle
@@ -56,6 +67,9 @@ type Config struct {
 func Middleware(cfg Config) func(http.Handler) http.Handler {
 	if cfg.ChallengeExpiry == 0 {
 		cfg.ChallengeExpiry = 5 * time.Minute
+	}
+	if cfg.Store == nil {
+		cfg.Store = NewMemoryStore()
 	}
 
 	// pre-compute method lookup for O(1) dispatch
@@ -92,8 +106,9 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 			}
 
 			// check expiry
+			var expiry time.Time
 			if cred.Challenge.Expires != "" {
-				expiry, err := time.Parse(time.RFC3339, cred.Challenge.Expires)
+				expiry, err = time.Parse(time.RFC3339, cred.Challenge.Expires)
 				if err != nil || time.Now().UTC().After(expiry) {
 					writeChallenge(w, r, &cfg)
 					return
@@ -114,15 +129,32 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 				return
 			}
 
-			// verify payment with the method provider
-			reference, err := method.Verify(r.Context(), cred, amount, currency)
+			// claim the credential: each one buys exactly one request
+			key, err := storeKey(method, cred)
 			if err != nil {
-				var pe *PaymentError
-				if errors.As(err, &pe) {
-					writeProblem(w, http.StatusPaymentRequired, pe.Problem, pe.Detail, "")
-				} else {
-					writeProblem(w, http.StatusPaymentRequired, ProblemVerificationFailed, err.Error(), "")
-				}
+				writeVerifyError(w, err)
+				return
+			}
+			claimed, err := cfg.Store.Claim(r.Context(), key, expiry)
+			if err != nil {
+				writeProblem(w, http.StatusInternalServerError, problemInternalError, "internal error", "")
+				return
+			}
+			if !claimed {
+				writeProblem(w, http.StatusPaymentRequired, ProblemInvalidChallenge, "payment credential has already been used", "")
+				return
+			}
+			// the claim is kept once the request is served. it is released only
+			// if the payment does not complete, so the client can retry.
+			release := func() {
+				_ = cfg.Store.Release(context.WithoutCancel(r.Context()), key)
+			}
+
+			// verify payment with the method provider
+			reference, err := method.Verify(withClaim(r.Context()), cred, amount, currency)
+			if err != nil {
+				release()
+				writeVerifyError(w, err)
 				return
 			}
 
@@ -131,7 +163,8 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 			// notify the billing system
 			if cfg.OnPayment != nil {
 				if err := cfg.OnPayment(r.Context(), receipt, cred, amount, currency); err != nil {
-					writeProblem(w, http.StatusInternalServerError, "https://paymentauth.org/problems/internal-error", "internal error", "")
+					release()
+					writeProblem(w, http.StatusInternalServerError, problemInternalError, "internal error", "")
 					return
 				}
 			}
@@ -192,6 +225,16 @@ func writeChallenge(w http.ResponseWriter, r *http.Request, cfg *Config) {
 
 	w.Header().Set("Cache-Control", "no-store")
 	writeProblem(w, http.StatusPaymentRequired, ProblemPaymentRequired, "Payment is required.", "")
+}
+
+// writeVerifyError writes a 402 for a failed credential verification.
+func writeVerifyError(w http.ResponseWriter, err error) {
+	var pe *PaymentError
+	if errors.As(err, &pe) {
+		writeProblem(w, http.StatusPaymentRequired, pe.Problem, pe.Detail, "")
+		return
+	}
+	writeProblem(w, http.StatusPaymentRequired, ProblemVerificationFailed, err.Error(), "")
 }
 
 func writeProblem(w http.ResponseWriter, status int, problemType, detail, challengeID string) {
