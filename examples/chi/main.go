@@ -17,7 +17,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
