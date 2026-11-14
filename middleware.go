@@ -54,9 +54,27 @@ type Config struct {
 	// shared Store, otherwise a credential can be spent once per instance.
 	Store Store
 
-	// AllowFallthrough, when true, calls the next handler even without payment
-	// if no Authorization: Payment header is present. This lets you handle
-	// both authenticated (API key) and MPP payment flows on the same route.
+	// FallthroughAuth lets a route take another kind of credential (an API
+	// key, a session token) beside MPP payment. It is called for a request
+	// whose Authorization header is present and is not a Payment credential.
+	// If it returns true the next handler is called without payment; if it
+	// returns false the request gets the 402 challenge, like one with no
+	// credential. It must validate the credential: returning true serves the
+	// request for free. When set, AllowFallthrough is ignored.
+	FallthroughAuth func(r *http.Request) bool
+
+	// AllowFallthrough, when true and FallthroughAuth is nil, calls the next
+	// handler without payment for ANY request whose Authorization header is
+	// present and is not a Payment credential. The middleware does not look
+	// at the header's value: "Authorization: Bearer x" passes. This is only
+	// safe when the next handler itself authenticates every request that
+	// arrives without a receipt (ReceiptFromContext returns nil) and rejects
+	// the ones it does not recognise. Without that check the route is free
+	// to anyone.
+	//
+	// Deprecated: set FallthroughAuth, which makes the check part of the
+	// middleware. AllowFallthrough is kept for servers that authenticate in
+	// the next handler.
 	AllowFallthrough bool
 }
 
@@ -89,10 +107,19 @@ func Middleware(cfg Config) func(http.Handler) http.Handler {
 			}
 
 			if cred == nil {
-				// non-Payment auth header (e.g. Bearer API key) — let it through in fallthrough mode
-				if cfg.AllowFallthrough && authHeader != "" {
-					next.ServeHTTP(w, r)
-					return
+				// non-Payment auth header (e.g. Bearer API key): served without
+				// payment only if FallthroughAuth accepts it, or, with the
+				// unchecked AllowFallthrough, on the next handler's word
+				if authHeader != "" {
+					if cfg.FallthroughAuth != nil {
+						if cfg.FallthroughAuth(r) {
+							next.ServeHTTP(w, r)
+							return
+						}
+					} else if cfg.AllowFallthrough {
+						next.ServeHTTP(w, r)
+						return
+					}
 				}
 
 				writeChallenge(w, r, &cfg)

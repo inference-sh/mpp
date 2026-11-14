@@ -284,6 +284,8 @@ func TestMiddleware_VerifyFails_Returns402(t *testing.T) {
 	}
 }
 
+// AllowFallthrough alone does not look at the credential: the next handler
+// is the one that must (see the field's doc).
 func TestMiddleware_AllowFallthrough_BearerPassesThrough(t *testing.T) {
 	cfg := newTestConfig()
 	cfg.AllowFallthrough = true
@@ -304,6 +306,106 @@ func TestMiddleware_AllowFallthrough_BearerPassesThrough(t *testing.T) {
 	}
 	if !handlerCalled {
 		t.Fatal("handler should be called in fallthrough mode with Bearer auth")
+	}
+}
+
+func bearerIs(key string) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		return r.Header.Get("Authorization") == "Bearer "+key
+	}
+}
+
+func TestMiddleware_FallthroughAuth(t *testing.T) {
+	tests := []struct {
+		name             string
+		allowFallthrough bool
+		authorization    string
+		wantCode         int
+		wantAuthCalled   bool
+	}{
+		{"valid key is served without payment", false, "Bearer good-key", 200, true},
+		{"unknown key gets the challenge", false, "Bearer x", 402, true},
+		{"another scheme gets the challenge", false, "Basic Zm9vOmJhcg==", 402, true},
+		{"unknown key gets the challenge even with AllowFallthrough", true, "Bearer x", 402, true},
+		{"no credential gets the challenge without asking", false, "", 402, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newTestConfig()
+			cfg.AllowFallthrough = tt.allowFallthrough
+			var authCalled bool
+			check := bearerIs("good-key")
+			cfg.FallthroughAuth = func(r *http.Request) bool {
+				authCalled = true
+				return check(r)
+			}
+			var handlerCalled bool
+			handler := Middleware(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handlerCalled = true
+				if ReceiptFromContext(r.Context()) != nil {
+					t.Error("a request served without payment has a receipt")
+				}
+				w.WriteHeader(200)
+			}))
+
+			req := httptest.NewRequest("POST", "/apps/run", nil)
+			if tt.authorization != "" {
+				req.Header.Set("Authorization", tt.authorization)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantCode)
+			}
+			if handlerCalled != (tt.wantCode == 200) {
+				t.Errorf("handler called = %v with status %d", handlerCalled, rec.Code)
+			}
+			if authCalled != tt.wantAuthCalled {
+				t.Errorf("FallthroughAuth called = %v, want %v", authCalled, tt.wantAuthCalled)
+			}
+			if tt.wantCode == 402 && rec.Header().Get("WWW-Authenticate") == "" {
+				t.Error("402 without a WWW-Authenticate challenge")
+			}
+		})
+	}
+}
+
+// A Payment credential is never handed to FallthroughAuth: it is verified
+// as a payment or refused.
+func TestMiddleware_FallthroughAuth_NotAskedAboutPaymentCredentials(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.FallthroughAuth = func(r *http.Request) bool {
+		t.Error("FallthroughAuth called for a Payment credential")
+		return true
+	}
+	handler := Middleware(cfg)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler called for a malformed Payment credential")
+	}))
+
+	req := httptest.NewRequest("POST", "/apps/run", nil)
+	req.Header.Set("Authorization", "Payment not-a-credential")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 402 {
+		t.Fatalf("status = %d, want 402", rec.Code)
+	}
+}
+
+// Neither option set: another scheme's credential gets the challenge.
+func TestMiddleware_NoFallthrough_BearerIssuesChallenge(t *testing.T) {
+	handler := Middleware(newTestConfig())(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("handler should not be called")
+	}))
+
+	req := httptest.NewRequest("POST", "/apps/run", nil)
+	req.Header.Set("Authorization", "Bearer x")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != 402 {
+		t.Fatalf("status = %d, want 402", rec.Code)
 	}
 }
 

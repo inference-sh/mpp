@@ -8,14 +8,21 @@
 //
 //	curl -i http://localhost:8080/v1/generate
 //
-// Test with API key (AllowFallthrough passes through):
+// Test with the API key (FallthroughAuth accepts it, no payment):
 //
-//	curl -i -H "Authorization: Bearer my-api-key" http://localhost:8080/v1/generate
+//	curl -i -X POST -H "Authorization: Bearer my-api-key" http://localhost:8080/v1/generate
+//
+// Test with any other key (gets the 402 challenge, like no key at all):
+//
+//	curl -i -X POST -H "Authorization: Bearer wrong" http://localhost:8080/v1/generate
+//
+// The key is API_KEY, "my-api-key" if unset.
 package main
 
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -33,6 +40,13 @@ func main() {
 
 	if stripeKey == "" || profileID == "" {
 		log.Fatal("set STRIPE_SECRET_KEY and STRIPE_PROFILE_ID")
+	}
+
+	// the one API key this demo accepts. a real server looks keys up in its
+	// own store
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		apiKey = "my-api-key"
 	}
 
 	// generate HMAC secret for signing challenges
@@ -67,8 +81,13 @@ func main() {
 			return nil
 		},
 
-		// allow Bearer API key requests to pass through without payment
-		AllowFallthrough: true,
+		// serve a request without payment only if it carries the API key.
+		// this check is what keeps the route paid: a header the function
+		// does not accept gets the 402 challenge
+		FallthroughAuth: func(r *http.Request) bool {
+			got := r.Header.Get("Authorization")
+			return subtle.ConstantTimeCompare([]byte(got), []byte("Bearer "+apiKey)) == 1
+		},
 	})
 
 	r := chi.NewRouter()
@@ -82,7 +101,7 @@ func main() {
 
 	// paid endpoints — MPP middleware gates access
 	r.Route("/v1", func(r chi.Router) {
-		r.Use(pay) // every route in /v1 requires payment (or API key with AllowFallthrough)
+		r.Use(pay) // every route in /v1 requires payment, or the API key (FallthroughAuth)
 
 		r.Post("/generate", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -97,7 +116,7 @@ func main() {
 					"receipt": receipt.Reference,
 				})
 			} else {
-				// passed through via API key (AllowFallthrough)
+				// no payment: FallthroughAuth accepted the API key
 				json.NewEncoder(w).Encode(map[string]any{
 					"result": "generated content here",
 					"paid":   false,
