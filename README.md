@@ -28,7 +28,10 @@ pay := mpp.Middleware(mpp.Config{
     Price: func(r *http.Request) (string, string, error) {
         return "50", "usd", nil // 50 cents
     },
-    AllowFallthrough: true, // let Bearer API key requests pass through
+    // serve a request with a valid API key without payment
+    FallthroughAuth: func(r *http.Request) bool {
+        return validAPIKey(r.Header.Get("Authorization")) // your own check
+    },
 })
 
 r := chi.NewRouter()
@@ -71,7 +74,8 @@ agent                                 your server
 - **HMAC-signed challenges** — tamper-proof price binding, constant-time verification
 - **multiple payment methods** — stripe SPT (fiat) built-in, implement `Method` interface for tempo, x402, lightning, or custom settlement
 - **crypto-ready** — string amounts throughout (no int64 precision loss for wei/lamports), `Method` interface is settlement-agnostic
-- **`AllowFallthrough`** — mount on the same route as API key auth. bearer tokens pass through, unauthenticated requests get a 402 challenge. this is the key feature for adding MPP to an existing API without separate routes
+- **`FallthroughAuth`** — mount on the same route as API key auth. a request whose `Authorization` header is not a payment is handed to your function: return true and it is served without payment, return false and it gets the 402 challenge, like an unauthenticated request. this is the key feature for adding MPP to an existing API without separate routes. the function must validate the credential; the middleware does not know your keys
+- **`AllowFallthrough`** (deprecated) — passes every non-payment `Authorization` header to the next handler without looking at it, so `Authorization: Bearer x` skips payment. only safe if the next handler authenticates every request that has no receipt. use `FallthroughAuth`
 - **`OnPayment` callback** — hook into your billing system after payment verification
 - **`PriceFn`** — dynamic per-request pricing. look up the resource, evaluate your pricing formula, return the cost
 - **context helpers** — `ReceiptFromContext(ctx)` and `CredentialFromContext(ctx)` in your handler
@@ -89,8 +93,11 @@ STRIPE_SECRET_KEY=sk_test_... STRIPE_PROFILE_ID=profile_test_... go run .
 # terminal 2: hit a paid endpoint (gets 402 challenge)
 curl -i http://localhost:8080/v1/generate
 
-# hit with an API key (AllowFallthrough passes through)
-curl -i -H "Authorization: Bearer my-api-key" http://localhost:8080/v1/generate
+# hit with the demo's API key (FallthroughAuth accepts it, no payment)
+curl -i -X POST -H "Authorization: Bearer my-api-key" http://localhost:8080/v1/generate
+
+# any other key gets the 402 challenge
+curl -i -X POST -H "Authorization: Bearer wrong" http://localhost:8080/v1/generate
 
 # hit a free endpoint
 curl -i http://localhost:8080/health

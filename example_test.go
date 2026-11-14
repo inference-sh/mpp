@@ -3,6 +3,7 @@ package mpp_test
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +11,13 @@ import (
 	"github.com/inference-sh/mpp"
 	"github.com/stripe/stripe-go/v84"
 )
+
+// validAPIKey reports whether an Authorization header carries this server's
+// API key. A real server looks the key up in its own store.
+func validAPIKey(authorization string) bool {
+	const want = "Bearer my-api-key"
+	return subtle.ConstantTimeCompare([]byte(authorization), []byte(want)) == 1
+}
 
 func Example() {
 	// generate a secret key for HMAC-signing challenges
@@ -42,8 +50,11 @@ func Example() {
 			return nil
 		},
 
-		// allow requests with Bearer API keys to pass through to normal auth
-		AllowFallthrough: true,
+		// serve a request that carries a valid API key without payment.
+		// anything else in the Authorization header gets the 402 challenge
+		FallthroughAuth: func(r *http.Request) bool {
+			return validAPIKey(r.Header.Get("Authorization"))
+		},
 	})
 
 	// use with any net/http compatible router (chi, gorilla, stdlib)
@@ -52,7 +63,7 @@ func Example() {
 		if receipt := mpp.ReceiptFromContext(r.Context()); receipt != nil {
 			fmt.Fprintf(w, `{"paid": true, "receipt": %q}`, receipt.Reference)
 		} else {
-			// AllowFallthrough=true: no MPP payment, request came via API key
+			// no MPP payment: FallthroughAuth accepted the request's API key
 			fmt.Fprint(w, `{"paid": false, "auth": "api_key"}`)
 		}
 	})))
