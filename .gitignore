@@ -16,3 +16,6 @@ go.work.sum
 .idea/
 .vscode/
 *.swp
+
+# example binaries (go build in examples/<name>)
+/examples/chi/chi
