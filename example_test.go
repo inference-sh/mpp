@@ -31,6 +31,10 @@ func Example() {
 		SecretKey: secretKey,
 		Realm:     "api.example.com",
 
+		// record spent credentials; use a shared store (Redis, a database)
+		// when more than one instance serves the route
+		Store: mpp.NewMemoryStore(),
+
 		Methods: []mpp.Method{
 			&mpp.StripeMethod{
 				Client:             stripe.NewClient("sk_test_..."),

@@ -49,9 +49,11 @@ type Config struct {
 	OnPayment func(ctx context.Context, receipt *Receipt, cred *Credential, amount, currency string) error
 
 	// Store records spent credentials so each one is accepted exactly once.
-	// Defaults to an in-process MemoryStore, which only protects a single
-	// server instance. Deployments with more than one instance must set a
-	// shared Store, otherwise a credential can be spent once per instance.
+	// It is required: Middleware panics without one. Deployments with more
+	// than one instance, or that must survive a restart within
+	// ChallengeExpiry, need a shared durable Store; otherwise a credential
+	// can be spent once per instance and again after each restart. A single
+	// instance that accepts that can pass NewMemoryStore().
 	Store Store
 
 	// FallthroughAuth lets a route take another kind of credential (an API
@@ -82,12 +84,17 @@ type Config struct {
 //
 // Without payment credential: returns 402 with WWW-Authenticate challenge headers.
 // With valid credential: verifies payment, attaches receipt to context, calls next handler.
+//
+// It panics if cfg.Store is nil (see Config.Store).
 func Middleware(cfg Config) func(http.Handler) http.Handler {
 	if cfg.ChallengeExpiry == 0 {
 		cfg.ChallengeExpiry = 5 * time.Minute
 	}
 	if cfg.Store == nil {
-		cfg.Store = NewMemoryStore()
+		// An implicit in-process store let a credential be spent once per
+		// instance and again after every restart, without the operator
+		// having chosen that.
+		panic(ErrStoreRequired)
 	}
 
 	// pre-compute method lookup for O(1) dispatch

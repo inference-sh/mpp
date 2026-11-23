@@ -46,6 +46,7 @@ func newTestConfig(methods ...Method) Config {
 			return "1000", "usd", nil
 		},
 		ChallengeExpiry: 5 * time.Minute,
+		Store:           NewMemoryStore(),
 	}
 }
 
@@ -548,4 +549,18 @@ func extractParam(header, name string) string {
 		return ""
 	}
 	return header[start : start+end]
+}
+
+// A nil Store used to default to an in-process MemoryStore, so a credential
+// could be spent once per instance and again after a restart without the
+// operator having chosen that (aikido 796590165).
+func TestMiddleware_RequiresStore(t *testing.T) {
+	cfg := newTestConfig()
+	cfg.Store = nil
+	defer func() {
+		if r := recover(); r != ErrStoreRequired {
+			t.Fatalf("Middleware without a Store: recovered %v, want ErrStoreRequired", r)
+		}
+	}()
+	Middleware(cfg)
 }
