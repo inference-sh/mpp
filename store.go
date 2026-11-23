@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"sync"
 	"time"
 )
@@ -64,6 +65,11 @@ func storeKey(method Method, cred *Credential) (string, error) {
 	return "mpp:" + hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ErrStoreRequired is what Middleware panics with when Config.Store is nil.
+var ErrStoreRequired = errors.New("mpp: Config.Store is required: use a store shared by every instance " +
+	"(Redis, a database), or NewMemoryStore() for a single instance that accepts " +
+	"a credential being spendable again after a restart")
+
 type settlementCtxKey struct{}
 
 // withClaim marks ctx as belonging to a request whose credential has been
@@ -83,9 +89,10 @@ func hasClaim(ctx context.Context) bool {
 // request that passed the expiry check just before the deadline cannot reclaim.
 const memoryStoreGrace = time.Minute
 
-// MemoryStore is an in-process Store. It is the default when Config.Store is nil
-// and is only sufficient for a single server instance: claims are not shared
-// between processes and are lost on restart.
+// MemoryStore is an in-process Store. It is only sufficient for a single server
+// instance: claims are not shared between processes and are lost on restart,
+// so a credential still inside its challenge expiry can be spent again after
+// one.
 type MemoryStore struct {
 	mu        sync.Mutex
 	claims    map[string]time.Time

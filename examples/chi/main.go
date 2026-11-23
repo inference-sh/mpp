@@ -60,6 +60,10 @@ func main() {
 		SecretKey: secretKey,
 		Realm:     "api.example.com",
 
+		// one instance: an in-process store. more than one, or restarts
+		// inside the challenge expiry: a shared store (see the README)
+		Store: mpp.NewMemoryStore(),
+
 		Methods: []mpp.Method{
 			&mpp.StripeMethod{
 				Client:             stripe.NewClient(stripeKey),

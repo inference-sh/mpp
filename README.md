@@ -28,6 +28,8 @@ pay := mpp.Middleware(mpp.Config{
     Price: func(r *http.Request) (string, string, error) {
         return "50", "usd", nil // 50 cents
     },
+    // spent credentials; shared by every instance (see replay protection)
+    Store: myRedisStore,
     // serve a request with a valid API key without payment
     FallthroughAuth: func(r *http.Request) bool {
         return validAPIKey(r.Header.Get("Authorization")) // your own check
@@ -107,7 +109,7 @@ curl -i http://localhost:8080/health
 
 a paid credential buys one request. before settling, the middleware claims the credential in a `Store`; a second request with the same credential gets a `402` and never reaches the payment provider.
 
-the default is an in-process `MemoryStore`. it covers a single server instance only. **if you run more than one instance, set a shared store**, otherwise a credential can be spent once per instance:
+`Store` is required; `Middleware` panics without one. **if you run more than one instance, use a shared store**, otherwise a credential can be spent once per instance:
 
 ```go
 mpp.Middleware(mpp.Config{
@@ -115,6 +117,8 @@ mpp.Middleware(mpp.Config{
     Store: myRedisStore, // implements mpp.Store
 })
 ```
+
+`mpp.NewMemoryStore()` is an in-process store for a single instance. its claims are lost on restart, so a credential still inside its challenge expiry (5 minutes by default) can be spent again after one.
 
 ```go
 type Store interface {
